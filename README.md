@@ -4,11 +4,9 @@ A selector for interactive Pi instances in panes on the current tmux server (Lin
 
 ## Installation
 
-Once this repository is published on GitHub, replace `<owner>` with its GitHub account or organization:
-
 ```sh
-nix profile install github:<owner>/pifzf#pifzf
-pi install git:github.com/<owner>/pifzf
+nix profile install github:moreauadrien/pifzf#pifzf
+pi install git:github.com/moreauadrien/pifzf
 ```
 
 Until then, from the repository root:
