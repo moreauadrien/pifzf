@@ -1,7 +1,14 @@
 use std::{
     env, fs,
     io::Write,
+    net::{TcpListener, TcpStream},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 const OUTSIDE: &str = "pifzf only works inside tmux";
@@ -108,6 +115,36 @@ fn list(socket: &str) -> Result<Vec<Pane>, String> {
     Ok(panes(&tmux(socket, &["list-panes", "-a", "-F", "#{pane_id}\t#{session_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_tty}\t#{@pifzf}"])?))
 }
 
+fn display(socket: &str) -> Result<String, String> {
+    let mut result = String::new();
+    for p in list(socket)? {
+        let Some((status, cwd)) = valid(&p) else { continue };
+        result.push_str(&format_row(&p, status, &cwd));
+    }
+    Ok(result)
+}
+
+fn format_row(p: &Pane, status: &str, cwd: &str) -> String {
+    let (color, label) = match status {
+        "blocking" => ("31", "blocking"),
+        "running" => ("33", "running"),
+        "subagents-running" => ("35", "subagents-running"),
+        _ => ("32", "idle"),
+    };
+    // No untrusted control sequences from cwd/session names in the selector.
+    let clean = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_control() && *c != '\u{1b}')
+            .collect::<String>()
+    };
+    format!(
+        "{}\t\x1b[{color}m{label}\x1b[0m  {}  {}\n",
+        p.id,
+        clean(&p.location),
+        clean(cwd)
+    )
+}
+
 fn run() -> Result<(), String> {
     let socket = env::var("TMUX")
         .ok()
@@ -136,46 +173,62 @@ fn run() -> Result<(), String> {
     {
         return Err(OUTSIDE.into());
     }
-    let entries: Vec<_> = list(&socket)?
-        .into_iter()
-        .filter_map(|p| valid(&p).map(|(s, cwd)| (p, s, cwd)))
-        .collect();
-    if entries.is_empty() {
+    let initial = display(&socket)?;
+    if initial.is_empty() {
         println!("No interactive Pi sessions found in tmux.");
         return Ok(());
     }
+    // fzf's HTTP listener accepts reload actions; polling tmux only reloads when the list changes.
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    drop(listener);
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let quoted = exe.to_string_lossy().replace('\'', "'\\''");
+    let action = format!("reload('{quoted}' --list)");
     let mut fzf = Command::new("fzf")
-        .args(["--ansi", "--delimiter=\t", "--with-nth=2..", "--no-multi"])
+        .args([
+            "--ansi",
+            "--delimiter=\t",
+            "--with-nth=2..",
+            "--no-multi",
+            &format!("--listen={port}"),
+        ])
+        .env("PIFZF_SOCKET", &socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    {
-        let mut stdin = fzf.stdin.take().ok_or("fzf: stdin unavailable")?;
-        for (p, status, cwd) in entries {
-            let (color, label) = match status {
-                "blocking" => ("31", "blocking"),
-                "running" => ("33", "running"),
-                "subagents-running" => ("35", "subagents-running"),
-                _ => ("32", "idle"),
-            };
-            // No untrusted control sequences from cwd/session names in the selector.
-            let clean = |s: &str| {
-                s.chars()
-                    .filter(|c| !c.is_control() && *c != '\u{1b}')
-                    .collect::<String>()
-            };
-            writeln!(
-                stdin,
-                "{}\t\x1b[{color}m{label}\x1b[0m  {}  {}",
-                p.id,
-                clean(&p.location),
-                clean(&cwd)
-            )
-            .map_err(|e| e.to_string())?;
+    fzf.stdin
+        .take()
+        .ok_or("fzf: stdin unavailable")?
+        .write_all(initial.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let watch_socket = socket.clone();
+    let watcher = thread::spawn(move || {
+        let mut previous = initial;
+        while !stopped.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(500));
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(next) = display(&watch_socket) {
+                if next != previous {
+                    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+                        let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{action}", action.len());
+                        if stream.write_all(request.as_bytes()).is_ok() {
+                            previous = next;
+                        }
+                    }
+                }
+            }
         }
-    }
-    let output = fzf.wait_with_output().map_err(|e| e.to_string())?;
+    });
+    let output = fzf.wait_with_output().map_err(|e| e.to_string());
+    stop.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    let output = output?;
     if !output.status.success() {
         if output.status.code() == Some(1) || output.status.code() == Some(130) {
             return Ok(());
@@ -193,6 +246,19 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    if env::args().nth(1).as_deref() == Some("--list") {
+        let result = env::var("PIFZF_SOCKET")
+            .map_err(|e| e.to_string())
+            .and_then(|socket| display(&socket));
+        match result {
+            Ok(rows) => print!("{rows}"),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if let Err(err) = run() {
         eprintln!("{err}");
         std::process::exit(1);
@@ -202,6 +268,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn row_reflects_state_changes() {
+        let pane = Pane {
+            id: "%12".into(),
+            session: "$1".into(),
+            location: "main:0.1".into(),
+            tty: "/dev/pts/1".into(),
+            metadata: String::new(),
+        };
+        assert_ne!(
+            format_row(&pane, "idle", "/tmp"),
+            format_row(&pane, "running", "/tmp")
+        );
+        assert!(format_row(&pane, "blocking", "/tmp").contains("\x1b[31mblocking"));
+        assert_eq!(
+            format_row(&pane, "idle", "/tmp\nmalicious")
+                .matches('\n')
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn selection_uses_exact_id_and_status_validation() {
         let pid = std::process::id();
